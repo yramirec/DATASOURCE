@@ -8,6 +8,8 @@ import org.springframework.data.domain.PageImpl;
 import org.springframework.data.domain.Pageable;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.jdbc.core.RowMapper;
+import org.springframework.jdbc.core.namedparam.MapSqlParameterSource;
+import org.springframework.jdbc.core.namedparam.NamedParameterJdbcTemplate;
 import org.springframework.stereotype.Repository;
 import pe.financieraoh.mscspfconcil.domain.model.PolicyActivation;
 import pe.financieraoh.mscspfconcil.domain.model.PolicyActivationRequest;
@@ -18,7 +20,9 @@ import pe.financieraoh.mscspfconcil.infrastucture.rest.mapper.SpfMapper;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 @Slf4j
 @Repository
@@ -41,19 +45,25 @@ public class SpfRepositoryImpl implements SpfRepository {
     @Override
     public Page<PolicyActivation> findPolicyActivations(Pageable pageable) {
         String queryOracle =  """
-            SELECT fls.nro_solicitud AS nroSolicitud,
-                   p.num_docum_ide AS numDocumIde,
-                   fls.mon_seguro AS monSeguro
-            FROM FINAN_LP_SOLICITUD fls
-            INNER JOIN PUC_PERSONAS p ON fls.cod_interno = p.cod_interno
+            SELECT * FROM (
+                SELECT fls.nro_solicitud AS nroSolicitud,
+                       p.num_docum_ide AS numDocumIde,
+                       fls.mon_seguro AS monSeguro,
+                       ROWNUM rnum
+                FROM EFINAN.FINAN_LP_SOLICITUD fls
+                INNER JOIN EFINAN.PUC_PERSONAS p ON fls.cod_interno = p.cod_interno
+            )
+            WHERE rnum > ? AND ROWNUM <= ?
         """;
 
         try {
-            List<PolicyActivation> policyActivations = oracleJdbcTemplate.query(queryOracle, new Object[]{pageable.getOffset(), pageable.getPageSize()}, new PolicyActivationRowMapper());
+            List<PolicyActivation> policyActivations = oracleJdbcTemplate.query(queryOracle,
+                    new Object[]{pageable.getOffset(), pageable.getOffset() + pageable.getPageSize()},
+                    new PolicyActivationRowMapper());
 
             fillAdditionalData(policyActivations);
 
-            long total = policyActivations.size(); // You should have a way to get the total count of records
+            long total = getTotalCount(); // Deberías tener una forma de obtener el conteo total de registros
 
             return new PageImpl<>(policyActivations, pageable, total);
         } catch (DataAccessException e) {
@@ -64,15 +74,23 @@ public class SpfRepositoryImpl implements SpfRepository {
 
     @Override
     public List<PolicyActivation> findPolicyActivationsFiltered(PolicyActivationRequest request) {
-        String queryOracle = "SELECT fls.nroSolicitud, p.numDocumIde, fls.monSeguro, " +
-                "NULL AS DIAS_SOLICITUD, NULL AS ESTADO_SEGURO, NULL AS TIPO_ERROR, " +
-                "NULL AS MOTIVO, NULL AS ULTIMA_FECHA_REPORTE, NULL AS FLAG_REPORTE " +
-                "FROM EFINAN.FINAN_LP_SOLICITUD fls " +
-                "INNER JOIN EFINAN.PUC_PERSONAS p ON fls.cod_interno = p.cod_interno " +
-                "WHERE fls.MON_SEGURO BETWEEN ? AND ? " +
-                "AND fls.vigencia >= ? " +
-                "AND fls.estadoSeguro = ? " +
-                "AND fls.ultimaFechaReporte BETWEEN ? AND ?";
+        String queryOracle = """
+            SELECT fls.nro_solicitud AS nroSolicitud, 
+                   p.num_docum_ide AS numDocumIde, 
+                   fls.mon_seguro AS monSeguro, 
+                   NULL AS DIAS_SOLICITUD, 
+                   NULL AS ESTADO_SEGURO, 
+                   NULL AS TIPO_ERROR, 
+                   NULL AS MOTIVO, 
+                   NULL AS ULTIMA_FECHA_REPORTE, 
+                   NULL AS FLAG_REPORTE 
+            FROM EFINAN.FINAN_LP_SOLICITUD fls 
+            INNER JOIN EFINAN.PUC_PERSONAS p ON fls.cod_interno = p.cod_interno 
+            WHERE fls.MON_SEGURO BETWEEN ? AND ? 
+              AND fls.vigencia >= ? 
+              AND fls.estado_seguro = ? 
+              AND fls.ultima_fecha_reporte BETWEEN ? AND ?
+        """;
 
         try {
             List<PolicyActivation> policyActivations = oracleJdbcTemplate.query(queryOracle, new Object[]{
@@ -94,9 +112,13 @@ public class SpfRepositoryImpl implements SpfRepository {
     }
 
     private void fillAdditionalData(List<PolicyActivation> policyActivations) {
-        String queryPostgres = "SELECT spf.numPoliza, spf.tipoError, spf.motivo " +
-                "FROM SpfConcilAfinityFeedbackEntity spf " +
-                "WHERE spf.numPoliza IN (:nroSolicitudes)";
+        String queryPostgres = """
+            SELECT spf.num_poliza AS numPoliza, 
+                   spf.tipo_error AS tipoError, 
+                   spf.motivo AS motivo 
+            FROM spf_concil_afinity_feedback spf 
+            WHERE spf.num_poliza IN (:nroSolicitudes)
+        """;
 
         List<String> nroSolicitudes = new ArrayList<>();
         for (PolicyActivation activation : policyActivations) {
@@ -104,9 +126,14 @@ public class SpfRepositoryImpl implements SpfRepository {
         }
 
         if (!nroSolicitudes.isEmpty()) {
-            List<SpfConcilAfinityFeedbackEntity> feedbackEntities = postgresJdbcTemplate.query(
+            Map<String, Object> params = new HashMap<>();
+            params.put("nroSolicitudes", nroSolicitudes);
+
+            NamedParameterJdbcTemplate namedParameterJdbcTemplate = new NamedParameterJdbcTemplate(postgresJdbcTemplate.getDataSource());
+
+            List<SpfConcilAfinityFeedbackEntity> feedbackEntities = namedParameterJdbcTemplate.query(
                     queryPostgres,
-                    new Object[]{nroSolicitudes},
+                    params,
                     new SpfConcilAfinityFeedbackRowMapper()
             );
 
@@ -122,19 +149,24 @@ public class SpfRepositoryImpl implements SpfRepository {
         }
     }
 
+    private long getTotalCount() {
+        String countQuery = "SELECT COUNT(*) FROM FINAN_LP_SOLICITUD fls INNER JOIN PUC_PERSONAS p ON fls.cod_interno = p.cod_interno";
+        return oracleJdbcTemplate.queryForObject(countQuery, Long.class);
+    }
+
     private static class PolicyActivationRowMapper implements RowMapper<PolicyActivation> {
         @Override
         public PolicyActivation mapRow(ResultSet rs, int rowNum) throws SQLException {
             return PolicyActivation.builder()
-                    .nroSolicitud(rs.getString("NRO_SOLICITUD"))
-                    .numDocumIde(rs.getString("num_docum_ide"))
-                    .monSeguro(rs.getBigDecimal("MON_SEGURO"))
-                    .diasSolicitud(rs.getLong("DIAS_SOLICITUD"))
-                    .estadoSeguro(rs.getString("ESTADO_SEGURO"))
-                    .tipoError(rs.getString("TIPO_ERROR"))
-                    .motivo(rs.getString("MOTIVO"))
-                    .ultimaFechaReporte(rs.getTimestamp("ULTIMA_FECHA_REPORTE").toLocalDateTime())
-                    .flagReporte(rs.getBoolean("FLAG_REPORTE"))
+                    .nroSolicitud(rs.getString("nroSolicitud"))
+                    .numDocumIde(rs.getString("numDocumIde"))
+                    .monSeguro(rs.getBigDecimal("monSeguro"))
+                    .diasSolicitud(null) // O rs.getLong("DIAS_SOLICITUD") si la columna existe
+                    .estadoSeguro(null) // O rs.getString("ESTADO_SEGURO") si la columna existe
+                    .tipoError(null) // O rs.getString("TIPO_ERROR") si la columna existe
+                    .motivo(null) // O rs.getString("MOTIVO") si la columna existe
+                    .ultimaFechaReporte(null) // O rs.getTimestamp("ULTIMA_FECHA_REPORTE") si la columna existe
+                    .flagReporte(false) // O rs.getBoolean("FLAG_REPORTE") si la columna existe
                     .build();
         }
     }
